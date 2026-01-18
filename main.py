@@ -1,115 +1,116 @@
 import asyncio
+import json
 import os
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
 
-# ====== SOZLAMALAR ======
+# ====== CONFIG ======
 TOKEN = os.getenv("BOT_TOKEN", "")
 if not TOKEN:
     raise SystemExit("BOT_TOKEN environment variable topilmadi!")
 
-ADMIN_ID = 8429326762          # <-- sizning ID (rasmda ko'rinyapti)
-CHANNEL_ID = 0                 # <-- keyin bu yerga -100.... ni qo'yamiz
+ADMIN_ID = 8429326762  # <-- shu yerga o'zingizni Telegram ID raqam qilib yozing
+DATA_FILE = "movies.json"
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
+# ====== STORAGE ======
+def load_movies() -> dict:
+    if not os.path.exists(DATA_FILE):
+        return {}
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
-# ====== KANAL ID NI OLISH UCHUN (ADMIN FORWARD QILSA) ======
-@dp.message(F.forward_from_chat)
-async def show_chat_id(message: Message):
-    if message.from_user is None:
-        return
-    if message.from_user.id != ADMIN_ID:
-        return
-    chat = message.forward_from_chat
-    await message.answer(f"✅ CHAT_ID: {chat.id}\nEndi CHANNEL_ID joyiga shuni qo'ying.")
+def save_movies(data: dict) -> None:
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
+MOVIES = load_movies()
 
-# ====== START ======
+# ====== HELPERS ======
+def is_admin(message: Message) -> bool:
+    return message.from_user and message.from_user.id == ADMIN_ID
+
+# ====== BOT HANDLERS ======
 @dp.message(F.text == "/start")
-async def start_cmd(message: Message):
+async def start(message: Message):
     await message.answer(
         "Salom! Kino kodini yuboring.\n"
-        "Admin: videoga reply qilib /add yozing.\n\n"
-        "Kanal ID olish: kanaldagi postni menga forward qiling."
+        "Masalan: 1001\n\n"
+        "Admin uchun: videoga reply qilib /add 1001"
     )
 
-
-# ====== ADD (ADMIN) ======
 @dp.message(F.text.startswith("/add"))
 async def add_movie(message: Message):
-    if message.from_user is None:
-        return
-
-    if message.from_user.id != ADMIN_ID:
+    # faqat admin qo'sha olsin
+    if not is_admin(message):
         await message.answer("❌ Siz admin emassiz.")
         return
 
-    if CHANNEL_ID == 0:
-        await message.answer("❗ Avval kanal postini menga forward qiling (CHAT_ID chiqadi).")
+    # /add 1001 -> kodni ajratib olish
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("❗ To‘g‘ri yozing: videoga reply qilib `/add 1001`")
         return
+    code = parts[1].strip()
 
+    # reply bo'lishi shart
     if not message.reply_to_message:
-        await message.answer("❗ Videoga reply qilib yozing: /add 1001")
+        await message.answer("❗ Videoga reply qiling, keyin `/add 1001` yozing.")
         return
 
-    parts = message.text.strip().split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        await message.answer("❗ To'g'ri yozing: /add 1001")
+    # reply qilingan xabarda video borligini tekshiramiz
+    video = message.reply_to_message.video
+    if not video:
+        await message.answer("❗ Siz videoga reply qilishingiz kerak.")
         return
 
-    code = parts[1]
+    MOVIES[code] = video.file_id
+    save_movies(MOVIES)
+    await message.answer(f"✅ Qo‘shildi! Kod: {code}")
 
-    # Reply qilingan xabarni kanalga copy qilamiz
-    sent = await bot.copy_message(
-        chat_id=CHANNEL_ID,
-        from_chat_id=message.chat.id,
-        message_id=message.reply_to_message.message_id
-    )
+@dp.message(F.text == "/list")
+async def list_movies(message: Message):
+    if not MOVIES:
+        await message.answer("Hali kino yo‘q.")
+        return
+    text = "🎬 Kinolar:\n" + "\n".join(sorted(MOVIES.keys()))
+    await message.answer(text)
 
-    # Kod sifatida "siz yozgan code" ishlaydi, lekin saqlash yo'q
-    # Shuning uchun kanal post_id ni ham berib qo'yamiz:
-    await message.answer(
-        f"✅ Kino kanalga saqlandi!\n"
-        f"🔢 Siz bergan kod: {code}\n"
-        f"🆔 Kanal post ID: {sent.message_id}\n\n"
-        f"Eng oson usul: kod sifatida kanal post ID ishlating: {sent.message_id}"
-    )
-
-
-# ====== KINO OLISH (USER KOD YUBORSA) ======
 @dp.message(F.text)
 async def get_movie(message: Message):
-    text = message.text.strip()
-
-    if text.startswith("/"):
-        return
-
-    if CHANNEL_ID == 0:
-        await message.answer("⚠️ Kanal hali ulanmagan. Admin kanal ID ni o'rnatishi kerak.")
-        return
-
-    if not text.isdigit():
-        await message.answer("❗ Faqat raqam (kino kodi) yuboring.")
-        return
-
-    movie_id = int(text)
-
-    try:
-        await bot.copy_message(
-            chat_id=message.chat.id,
-            from_chat_id=CHANNEL_ID,
-            message_id=movie_id
-        )
-    except Exception:
+    code = message.text.strip()
+    file_id = MOVIES.get(code)
+    if file_id:
+        await bot.send_video(chat_id=message.chat.id, video=file_id)
+    else:
         await message.answer("❌ Bunday kod topilmadi.")
 
+# ====== RENDER PORT (WEB SERVICE uchun) ======
+async def handle_root(request):
+    return web.Response(text="OK")
 
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_root)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.getenv("PORT", "10000"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+# ====== MAIN ======
 async def main():
+    await start_web_server()   # Render port ko'rsin
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())

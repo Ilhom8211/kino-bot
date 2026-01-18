@@ -308,7 +308,7 @@ async def text_router(m: Message):
     # Boshqa textlar
     if is_admin(m.from_user.id):
         return await m.answer(
-            Отправьте код фильма (например 1001) или /panel.",
+            "Отправьте код фильма (например 1001) или /panel.",
             reply_markup=kb_main(True)
         )
     return await m.answer("Отправьте код фильма (например 1001).")

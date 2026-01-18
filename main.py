@@ -1,25 +1,23 @@
-import asyncio
-import json
 import os
-from datetime import datetime
+import json
+import asyncio
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 
-# ====== SETTINGS ======
 TOKEN = os.getenv("BOT_TOKEN", "")
 if not TOKEN:
     raise SystemExit("BOT_TOKEN environment variable topilmadi!")
 
-ADMIN_ID = 8429326762  # <-- O'ZINGIZNING ADMIN ID
+ADMIN_ID = 8429326762  # <-- shu yerga admin ID (raqam!)
 DATA_FILE = "movies.json"
-CHANNEL_FILE = "channel.json"
-# ======================
+STATE_FILE = "state.json"
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# ---------- Storage helpers ----------
+# ---------- Storage ----------
 def load_json(path: str, default):
     if not os.path.exists(path):
         return default
@@ -29,230 +27,194 @@ def load_json(path: str, default):
     except Exception:
         return default
 
-
 def save_json(path: str, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+MOVIES = load_json(DATA_FILE, {})          # { "1001": {"file_id": "...", "title": "..."} }
+STATE = load_json(STATE_FILE, {"waiting": {}})  # {"waiting": {"8429...": "add" / "del"}}
 
-MOVIES = load_json(DATA_FILE, {})
-CHANNEL = load_json(CHANNEL_FILE, {"chat_id": None, "title": None})
-
-# ---------- Keyboards ----------
-def user_kb():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🎬 Kino olish")],
-            [KeyboardButton(text="ℹ️ Yordam")]
-        ],
-        resize_keyboard=True
-    )
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
 
 def admin_kb():
     return ReplyKeyboardMarkup(
         keyboard=[
+            [KeyboardButton(text="⚙️ Admin panel")],
             [KeyboardButton(text="➕ Kino qo‘shish"), KeyboardButton(text="🗑 Kino o‘chirish")],
-            [KeyboardButton(text="📊 Statistika"), KeyboardButton(text="⚙️ Admin panel")]
+            [KeyboardButton(text="📊 Statistika")],
         ],
         resize_keyboard=True
     )
 
-def is_admin(message: Message) -> bool:
-    return message.from_user and message.from_user.id == ADMIN_ID
-
-
-# ---------- Commands ----------
-@dp.message(F.text == "/start")
-async def start(message: Message):
-    text = (
-        "Salom! Kino kodini yuboring.\n"
-        "Masalan: 1001\n\n"
-        "Admin uchun:\n"
-        "1) Kanal postini menga FORWARD qiling (CHAT_ID chiqadi)\n"
-        "2) Videoga reply qilib: /add 1001\n"
+def user_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔎 Kino qidirish")],
+        ],
+        resize_keyboard=True
     )
-    if is_admin(message):
+
+# ---------- Simple HTTP server (Render port) ----------
+async def handle_root(request):
+    return web.Response(text="OK")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_root)
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.getenv("PORT", "10000"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"HTTP server started on port {port}")
+
+# ---------- Bot Handlers ----------
+@dp.message(F.text == "/start")
+async def cmd_start(message: Message):
+    text = "Salom! Kino kodini yuboring.\nMasalan: 1001"
+    if is_admin(message.from_user.id):
+        text += "\n\nAdmin: /panel"
         await message.answer(text, reply_markup=admin_kb())
     else:
         await message.answer(text, reply_markup=user_kb())
 
-
 @dp.message(F.text == "/panel")
-async def panel_cmd(message: Message):
-    if not is_admin(message):
-        return
-    await message.answer("⚙️ Admin panel", reply_markup=admin_kb())
+async def panel(message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.answer("❌ Siz admin emassiz.")
+    await message.answer("⚙️ Admin panel:", reply_markup=admin_kb())
 
-
-# ---------- Admin buttons ----------
 @dp.message(F.text == "⚙️ Admin panel")
 async def panel_btn(message: Message):
-    if not is_admin(message):
-        return
-    await message.answer("⚙️ Admin panel (buyruqlar):\n"
-                         "➕ Kino qo‘shish (videoga reply qilib /add 1001)\n"
-                         "🗑 Kino o‘chirish (/del 1001)\n"
-                         "📊 Statistika (/stats)\n"
-                         "Kanal chat_id olish: kanal postini menga forward qiling")
-
-
-@dp.message(F.text == "📊 Statistika")
-async def stats_btn(message: Message):
-    if not is_admin(message):
-        return
-    await send_stats(message)
-
+    await panel(message)
 
 @dp.message(F.text == "➕ Kino qo‘shish")
 async def add_btn(message: Message):
-    if not is_admin(message):
-        return
-    await message.answer("➕ Kino qo‘shish:\n"
-                         "1) Kanal postini forward qiling (CHAT_ID chiqadi)\n"
-                         "2) Kanalga video tashlang\n"
-                         "3) Video postga reply qilib yuboring: /add 1001")
-
+    if not is_admin(message.from_user.id):
+        return await message.answer("❌ Siz admin emassiz.")
+    STATE["waiting"][str(message.from_user.id)] = "add"
+    save_json(STATE_FILE, STATE)
+    await message.answer("🎬 Video yuboring (video'ga reply qilib /add KOD ham bo‘ladi).")
 
 @dp.message(F.text == "🗑 Kino o‘chirish")
 async def del_btn(message: Message):
-    if not is_admin(message):
-        return
-    await message.answer("🗑 Kino o‘chirish:\nMasalan: /del 1001")
+    if not is_admin(message.from_user.id):
+        return await message.answer("❌ Siz admin emassiz.")
+    STATE["waiting"][str(message.from_user.id)] = "del"
+    save_json(STATE_FILE, STATE)
+    await message.answer("🗑 O‘chirish uchun kod yuboring. Masalan: 1001")
 
+@dp.message(F.text == "📊 Statistika")
+async def stats_btn(message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.answer("❌ Siz admin emassiz.")
+    count = len(MOVIES)
+    await message.answer(f"📊 Statistika:\n🎞 Bazada kinolar: {count} ta")
 
-# ---------- User buttons ----------
-@dp.message(F.text == "🎬 Kino olish")
-async def get_btn(message: Message):
-    await message.answer("Kino kodini yuboring.\nMasalan: 1001")
-
-
-@dp.message(F.text == "ℹ️ Yordam")
-async def help_btn(message: Message):
-    await message.answer("ℹ️ Yordam:\n"
-                         "1) Kino olish: kod yuborasiz (1001)\n"
-                         "2) Admin bo‘lsangiz: /panel\n")
-
-
-# ---------- Forward from channel: save CHAT_ID ----------
-@dp.message(F.forward_from_chat)
-async def forward_handler(message: Message):
-    """
-    Kanal postini botga forward qilinsa:
-    CHANNEL chat_id saqlaydi va admin'ga ko'rsatadi
-    """
-    if not is_admin(message):
-        return
-
-    chat = message.forward_from_chat
-    # channel / supergroup bo'lishi mumkin, lekin bizga chat.id kerak
-    CHANNEL["chat_id"] = chat.id
-    CHANNEL["title"] = getattr(chat, "title", None)
-    CHANNEL["saved_at"] = datetime.now().isoformat(timespec="seconds")
-    save_json(CHANNEL_FILE, CHANNEL)
-
-    await message.answer(f"✅ Kanal CHAT_ID saqlandi:\n{CHANNEL['chat_id']}\n📣 {CHANNEL.get('title')}")
-
-
-# ---------- Admin: Add movie ----------
 @dp.message(F.text.startswith("/add"))
-async def add_movie(message: Message):
-    if not is_admin(message):
-        return
-
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) < 2:
-        await message.answer("❗️To‘g‘ri yozing: /add 1001 (videoga reply qilib)")
-        return
-
-    code = parts[1].strip()
+async def add_cmd(message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.answer("❌ Siz admin emassiz.")
 
     if not message.reply_to_message or not message.reply_to_message.video:
-        await message.answer("❗️Videoga reply qiling va /add 1001 yozing.")
-        return
+        return await message.answer("❗ /add ishlashi uchun videoga reply qiling.\nMasalan: video'ga reply qilib /add 1001")
 
-    # Agar kanal chat_id hali saqlanmagan bo'lsa ogohlantiramiz
-    if not CHANNEL.get("chat_id"):
-        await message.answer("❗️ Avval kanal postini menga forward qiling (CHAT_ID chiqadi).")
-        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        return await message.answer("❗ Kod yozing. Masalan: /add 1001")
 
+    code = parts[1].strip()
     file_id = message.reply_to_message.video.file_id
-    MOVIES[code] = file_id
-    save_json(DATA_FILE, MOVIES)
 
+    MOVIES[code] = {"file_id": file_id}
+    save_json(DATA_FILE, MOVIES)
     await message.answer(f"✅ Qo‘shildi! Kod: {code}")
 
-
-# ---------- Admin: Delete movie ----------
 @dp.message(F.text.startswith("/del"))
-async def del_movie(message: Message):
-    if not is_admin(message):
-        return
-    parts = (message.text or "").split(maxsplit=1)
+async def del_cmd(message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.answer("❌ Siz admin emassiz.")
+
+    parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
-        await message.answer("❗️To‘g‘ri yozing: /del 1001")
-        return
+        return await message.answer("❗ Kod yozing. Masalan: /del 1001")
 
     code = parts[1].strip()
     if code in MOVIES:
-        MOVIES.pop(code, None)
+        MOVIES.pop(code)
         save_json(DATA_FILE, MOVIES)
-        await message.answer(f"🗑 O‘chirildi: {code}")
-    else:
-        await message.answer("❌ Bunday kod topilmadi.")
+        return await message.answer(f"🗑 O‘chirildi: {code}")
 
+    await message.answer("❌ Bunday kod topilmadi.")
 
-# ---------- Admin: Stats ----------
-@dp.message(F.text == "/stats")
-async def stats_cmd(message: Message):
-    if not is_admin(message):
+@dp.message(F.video)
+async def video_came(message: Message):
+    # Agar admin "Kino qo‘shish" bosgan bo‘lsa, keyin kod so‘raymiz
+    if not is_admin(message.from_user.id):
         return
-    await send_stats(message)
 
+    if STATE["waiting"].get(str(message.from_user.id)) == "add":
+        STATE["waiting"][str(message.from_user.id)] = "add_wait_code"
+        save_json(STATE_FILE, STATE)
+        # vaqtинча video file_id ни state га сақлаб қўямиз
+        STATE["last_video_file_id"] = message.video.file_id
+        save_json(STATE_FILE, STATE)
+        await message.answer("✅ Video olindi. Endi kod yuboring (masalan: 1001).")
 
-async def send_stats(message: Message):
-    total = len(MOVIES)
-    ch = CHANNEL.get("chat_id")
-    title = CHANNEL.get("title")
-    await message.answer(
-        "📊 Statistika:\n"
-        f"🎞 Kinolar soni: {total}\n"
-        f"📣 Kanal: {title if title else '-'}\n"
-        f"🆔 CHAT_ID: {ch if ch else 'saqlanmagan'}"
-    )
-
-
-# ---------- Get movie by code (IMPORTANT: ignore buttons!) ----------
 @dp.message(F.text)
-async def get_movie(message: Message):
-    text = (message.text or "").strip()
-    if not text:
-        return
+async def any_text(message: Message):
+    text = message.text.strip()
 
-    # ✅ tugmalar matnlari kino kodi bo'lib ketmasin
-    ignore = {
-        "🎬 Kino olish", "ℹ️ Yordam",
-        "➕ Kino qo‘shish", "🗑 Kino o‘chirish",
-        "📊 Statistika", "⚙️ Admin panel",
-        "Admin panel", "Kino qo‘shish", "Kino o‘chirish", "Statistika"
-    }
-    if text in ignore:
-        return
+    # Admin flow: video keldi, endi kod kutilyapti
+    if is_admin(message.from_user.id) and STATE["waiting"].get(str(message.from_user.id)) == "add_wait_code":
+        code = text
+        file_id = STATE.get("last_video_file_id")
+        if not file_id:
+            STATE["waiting"].pop(str(message.from_user.id), None)
+            save_json(STATE_FILE, STATE)
+            return await message.answer("❌ Video topilmadi. Qaytadan 'Kino qo‘shish' bosing.")
+        MOVIES[code] = {"file_id": file_id}
+        save_json(DATA_FILE, MOVIES)
+        STATE["waiting"].pop(str(message.from_user.id), None)
+        STATE.pop("last_video_file_id", None)
+        save_json(STATE_FILE, STATE)
+        return await message.answer(f"✅ Qo‘shildi! Kod: {code}")
 
-    # /... komandalar boshqa handlerlarda
-    if text.startswith("/"):
-        return
+    # Admin flow: delete waiting
+    if is_admin(message.from_user.id) and STATE["waiting"].get(str(message.from_user.id)) == "del":
+        code = text
+        if code in MOVIES:
+            MOVIES.pop(code)
+            save_json(DATA_FILE, MOVIES)
+            STATE["waiting"].pop(str(message.from_user.id), None)
+            save_json(STATE_FILE, STATE)
+            return await message.answer(f"🗑 O‘chirildi: {code}")
+        else:
+            return await message.answer("❌ Bunday kod topilmadi.")
 
-    code = text
-    file_id = MOVIES.get(code)
-    if file_id:
-        await bot.send_video(chat_id=message.chat.id, video=file_id)
+    # User search: if number -> send video
+    if text.isdigit():
+        code = text
+        movie = MOVIES.get(code)
+        if not movie:
+            return await message.answer("❌ Bunday kod topilmadi.")
+        return await message.answer_video(movie["file_id"], caption=f"🎬 Kod: {code}")
+
+    # fallback
+    if is_admin(message.from_user.id):
+        await message.answer("Kod yuboring (masalan: 1001) yoki /panel.")
     else:
-        await message.answer("❌ Bunday kod topilmadi.")
+        await message.answer("Kino kodini yuboring (masalan: 1001).")
 
-
+# ---------- Main ----------
 async def main():
-    await dp.start_polling(bot)
+    # Render Web Service uchun port server
+    await start_web_server()
 
+    # Bot polling
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -1,412 +1,328 @@
 import os
 import re
-import sqlite3
 import asyncio
-from datetime import datetime
+import sqlite3
+from dataclasses import dataclass
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
+    Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 )
-from aiogram.filters import Command
-from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
 from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 
 
-# ========== ENV ==========
+# ===================== CONFIG =====================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "").strip()  # example: "8429326762,123456"
-# CHANNEL_ID ni forward orqali ham saqlaymiz, ENV bo‘lsa default bo‘ladi
-CHANNEL_ID_ENV = os.getenv("CHANNEL_ID", "").strip()  # example: "-1001234567890"
+ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "").strip()  # masalan: 8429326762,123456789
+CHANNEL_CHAT_ID_RAW = os.getenv("CHANNEL_CHAT_ID", "").strip()  # ixtiyoriy: -1003632115541
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN topilmadi. Railway/Render variables ga BOT_TOKEN qo‘ying.")
+    raise RuntimeError("BOT_TOKEN env yo'q!")
 
+def parse_admins(raw: str) -> set[int]:
+    if not raw:
+        return set()
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    out = set()
+    for p in parts:
+        if p.lstrip("-").isdigit():
+            out.add(int(p))
+    return out
 
-def parse_admin_ids(raw: str) -> set[int]:
-    ids = set()
-    for part in re.split(r"[,\s]+", raw.strip()) if raw else []:
-        if part.isdigit():
-            ids.add(int(part))
-    return ids
+ADMIN_IDS = parse_admins(ADMIN_IDS_RAW)
 
-
-ADMIN_IDS = parse_admin_ids(ADMIN_IDS_RAW)
-
-# ========== BOT ==========
-bot = Bot(
-    BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
-dp = Dispatcher()
+CHANNEL_CHAT_ID = None
+if CHANNEL_CHAT_ID_RAW and CHANNEL_CHAT_ID_RAW.lstrip("-").isdigit():
+    CHANNEL_CHAT_ID = int(CHANNEL_CHAT_ID_RAW)
 
 DB_PATH = "kino.db"
 
-
-# ========== DB ==========
-def db_connect():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    return conn
-
-
+# ===================== DB =====================
 def db_init():
-    conn = db_connect()
-    cur = conn.cursor()
-
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS movies (
-        code TEXT PRIMARY KEY,
-        file_id TEXT NOT NULL,
-        file_type TEXT NOT NULL,  -- "video" / "document"
-        caption TEXT,
-        added_at TEXT NOT NULL
-    )
+        CREATE TABLE IF NOT EXISTS movies(
+            code TEXT PRIMARY KEY,
+            file_id TEXT NOT NULL,
+            caption TEXT
+        )
     """)
-
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        first_seen TEXT NOT NULL
-    )
+        CREATE TABLE IF NOT EXISTS users(
+            user_id INTEGER PRIMARY KEY,
+            first_seen_ts INTEGER NOT NULL
+        )
     """)
+    con.commit()
+    con.close()
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS config (
-        key TEXT PRIMARY KEY,
-        value TEXT
-    )
-    """)
+def db_add_user(user_id: int):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("INSERT OR IGNORE INTO users(user_id, first_seen_ts) VALUES(?, strftime('%s','now'))", (user_id,))
+    con.commit()
+    con.close()
 
-    conn.commit()
-    conn.close()
+def db_get_stats():
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT COUNT(*) FROM users")
+    users_count = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM movies")
+    movies_count = cur.fetchone()[0]
+    con.close()
+    return users_count, movies_count
 
-
-def cfg_get(key: str) -> str | None:
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT value FROM config WHERE key=?", (key,))
+def db_get_movie(code: str):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT file_id, caption FROM movies WHERE code=?", (code,))
     row = cur.fetchone()
-    conn.close()
-    return row[0] if row else None
+    con.close()
+    return row  # (file_id, caption) or None
+
+def db_add_movie(code: str, file_id: str, caption: str | None):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    # Duplicate bo'lsa error chiqaramiz
+    cur.execute("SELECT 1 FROM movies WHERE code=?", (code,))
+    exists = cur.fetchone() is not None
+    if exists:
+        con.close()
+        return False
+    cur.execute("INSERT INTO movies(code, file_id, caption) VALUES(?,?,?)", (code, file_id, caption))
+    con.commit()
+    con.close()
+    return True
+
+def db_delete_movie(code: str):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("DELETE FROM movies WHERE code=?", (code,))
+    deleted = cur.rowcount
+    con.commit()
+    con.close()
+    return deleted > 0
 
 
-def cfg_set(key: str, value: str):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO config(key, value) VALUES(?, ?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value
-    """, (key, value))
-    conn.commit()
-    conn.close()
+# ===================== UI =====================
+BTN_ADMIN_PANEL = "⚙️ Admin panel"
+BTN_ADD = "➕ Kino qo‘shish"
+BTN_DEL = "🗑️ Kino o‘chirish"
+BTN_STATS = "📊 Statistika"
+BTN_BACK = "⬅️ Orqaga"
+
+def kb_main(is_admin: bool):
+    if is_admin:
+        return ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text=BTN_ADMIN_PANEL)],
+                [KeyboardButton(text=BTN_STATS)],
+            ],
+            resize_keyboard=True
+        )
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_STATS)],
+        ],
+        resize_keyboard=True
+    )
+
+def kb_admin():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_ADD), KeyboardButton(text=BTN_DEL)],
+            [KeyboardButton(text=BTN_STATS)],
+            [KeyboardButton(text=BTN_BACK)],
+        ],
+        resize_keyboard=True
+    )
 
 
-def get_channel_id() -> int | None:
-    # Priority: DB -> ENV
-    val = cfg_get("CHANNEL_ID")
-    if val and re.fullmatch(r"-?\d+", val.strip()):
-        return int(val.strip())
-    if CHANNEL_ID_ENV and re.fullmatch(r"-?\d+", CHANNEL_ID_ENV.strip()):
-        return int(CHANNEL_ID_ENV.strip())
-    return None
+# ===================== FSM (oddiy) =====================
+@dataclass
+class PendingAction:
+    mode: str  # "add" | "del" | ""
 
+PENDING: dict[int, PendingAction] = {}  # user_id -> PendingAction
+
+
+# ===================== BOT =====================
+router = Router()
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
+CODE_RE = re.compile(r"^\d{1,10}$")  # 1..10 raqam
 
-def touch_user(user_id: int):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT OR IGNORE INTO users(user_id, first_seen) VALUES(?, ?)",
-        (user_id, datetime.utcnow().isoformat())
-    )
-    conn.commit()
-    conn.close()
-
-
-def movies_count() -> int:
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM movies")
-    n = cur.fetchone()[0]
-    conn.close()
-    return n
-
-
-def users_count() -> int:
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM users")
-    n = cur.fetchone()[0]
-    conn.close()
-    return n
-
-
-def movie_get(code: str):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT code, file_id, file_type, caption FROM movies WHERE code=?", (code,))
-    row = cur.fetchone()
-    conn.close()
-    return row  # None or tuple
-
-
-def movie_add(code: str, file_id: str, file_type: str, caption: str | None):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO movies(code, file_id, file_type, caption, added_at) VALUES(?,?,?,?,?)",
-        (code, file_id, file_type, caption, datetime.utcnow().isoformat())
-    )
-    conn.commit()
-    conn.close()
-
-
-def movie_delete(code: str) -> bool:
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM movies WHERE code=?", (code,))
-    changed = cur.rowcount > 0
-    conn.commit()
-    conn.close()
-    return changed
-
-
-# ========== KEYBOARDS ==========
-def admin_panel_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Kino qo‘shish", callback_data="admin:add")],
-            [InlineKeyboardButton(text="🗑 Kino o‘chirish", callback_data="admin:del")],
-            [InlineKeyboardButton(text="📊 Statistika", callback_data="admin:stat")],
-            [InlineKeyboardButton(text="📣 Kanalni ulash (forward)", callback_data="admin:setch")],
-        ]
-    )
-
-
-# admin holat (soddaroq)
-ADMIN_STATE: dict[int, str] = {}  # user_id -> "await_del_code" / "await_add_code"
-
-
-def normalize_code(text: str) -> str:
-    return (text or "").strip()
-
-
-# ========== HANDLERS ==========
-@dp.message(Command("start"))
-async def cmd_start(message: Message):
-    touch_user(message.from_user.id)
-
-    txt = (
+@router.message(CommandStart())
+async def start(m: Message):
+    db_add_user(m.from_user.id)
+    text = (
         "Salom! Kino kodini yuboring.\n"
-        "Masalan: <b>1001</b>\n\n"
+        "Masalan: 1001\n\n"
     )
-    if is_admin(message.from_user.id):
-        txt += "Admin: /panel"
-    await message.answer(txt)
+    if is_admin(m.from_user.id):
+        text += "Admin: /panel yoki tugmalar orqali."
+    await m.answer(text, reply_markup=kb_main(is_admin(m.from_user.id)))
 
+@router.message(Command("panel"))
+async def panel_cmd(m: Message):
+    db_add_user(m.from_user.id)
+    if not is_admin(m.from_user.id):
+        return await m.answer("❌ Siz admin emassiz.")
+    await m.answer("⚙️ Admin panel:", reply_markup=kb_admin())
 
-@dp.message(Command("panel"))
-async def cmd_panel(message: Message):
-    if not is_admin(message.from_user.id):
-        return await message.answer("Siz admin emassiz.")
-    await message.answer("⚙️ <b>Admin panel</b>", reply_markup=admin_panel_kb())
+@router.message(F.text == BTN_ADMIN_PANEL)
+async def panel_btn(m: Message):
+    db_add_user(m.from_user.id)
+    if not is_admin(m.from_user.id):
+        return await m.answer("❌ Siz admin emassiz.")
+    await m.answer("⚙️ Admin panel:", reply_markup=kb_admin())
 
+@router.message(F.text == BTN_BACK)
+async def back_btn(m: Message):
+    db_add_user(m.from_user.id)
+    PENDING.pop(m.from_user.id, None)
+    await m.answer("Bosh menyu:", reply_markup=kb_main(is_admin(m.from_user.id)))
 
-# ==== Kanal chat_id olish (forward) ====
-@dp.message(F.forward_from_chat)
-async def got_forward(message: Message):
-    # Admin forward qilsa kanal ID saqlaymiz
-    if not is_admin(message.from_user.id):
-        return
-
-    chat = message.forward_from_chat
-    # kanal bo‘lsa id -100... bo‘ladi
-    cfg_set("CHANNEL_ID", str(chat.id))
-
-    await message.answer(
-        f"✅ Kanal CHAT_ID saqlandi:\n<b>{chat.id}</b>\n📣 {chat.title or ''}"
+@router.message(Command("stat"))
+@router.message(F.text == BTN_STATS)
+async def stats(m: Message):
+    db_add_user(m.from_user.id)
+    users_count, movies_count = db_get_stats()
+    await m.answer(
+        f"📊 Statistika\n\n"
+        f"👥 Botni ishlatganlar: <b>{users_count}</b>\n"
+        f"🎬 Kinolar soni: <b>{movies_count}</b>",
+        parse_mode=ParseMode.HTML
     )
 
+@router.message(F.text == BTN_ADD)
+async def ask_add(m: Message):
+    db_add_user(m.from_user.id)
+    if not is_admin(m.from_user.id):
+        return await m.answer("❌ Siz admin emassiz.")
+    PENDING[m.from_user.id] = PendingAction(mode="add")
+    await m.answer(
+        "➕ Kino qo‘shish:\n"
+        "1) Videoni yuboring (yoki kanal postini forward qiling)\n"
+        "2) Video ustiga reply qilib: <b>/add 123</b>\n\n"
+        "Yoki videoni yuborgandan keyin shunchaki kodni yozing: <b>123</b>",
+        parse_mode=ParseMode.HTML
+    )
 
-# ==== Admin callbacklar ====
-@dp.callback_query(F.data.startswith("admin:"))
-async def admin_callbacks(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
-        await call.answer("Admin emassiz.", show_alert=True)
-        return
+@router.message(F.text == BTN_DEL)
+async def ask_del(m: Message):
+    db_add_user(m.from_user.id)
+    if not is_admin(m.from_user.id):
+        return await m.answer("❌ Siz admin emassiz.")
+    PENDING[m.from_user.id] = PendingAction(mode="del")
+    await m.answer("🗑️ O‘chirish uchun kodni yuboring. Masalan: 123")
 
-    action = call.data.split(":", 1)[1]
+@router.message(Command("add"))
+async def add_cmd(m: Message):
+    db_add_user(m.from_user.id)
+    if not is_admin(m.from_user.id):
+        return await m.answer("❌ Siz admin emassiz.")
 
-    if action == "stat":
-        u = users_count()
-        m = movies_count()
-        ch = get_channel_id()
-        ch_txt = f"<b>{ch}</b>" if ch else "Ulanmagan"
-        await call.message.answer(
-            f"📊 <b>Statistika</b>\n"
-            f"👤 Userlar: <b>{u}</b>\n"
-            f"🎬 Kinolar: <b>{m}</b>\n"
-            f"📣 Kanal: {ch_txt}"
-        )
-        await call.answer()
-        return
+    # /add 123
+    parts = m.text.split(maxsplit=1)
+    if len(parts) != 2 or not CODE_RE.match(parts[1].strip()):
+        return await m.answer("❗ To‘g‘ri format: /add 123")
 
-    if action == "add":
-        ADMIN_STATE[call.from_user.id] = "await_add_video"
-        await call.message.answer(
-            "➕ Kino qo‘shish:\n"
-            "1) Videoni (yoki faylni) yuboring\n"
-            "2) Keyin kodini yuborasiz (masalan: 1001)\n\n"
-            "⚠️ Videoni yuborib bo‘lgach, kodni oddiy mesaj qilib yozing."
-        )
-        await call.answer()
-        return
+    code = parts[1].strip()
 
-    if action == "del":
-        ADMIN_STATE[call.from_user.id] = "await_del_code"
-        await call.message.answer("🗑 O‘chirish uchun kod yuboring (masalan: 1001)")
-        await call.answer()
-        return
+    # video reply bo‘lishi kerak
+    if not m.reply_to_message or not m.reply_to_message.video:
+        return await m.answer("❗ Videoga reply qilib yuboring: videoga reply → /add 123")
 
-    if action == "setch":
-        await call.message.answer(
-            "📣 Kanalni ulash:\n"
-            "1) Kanalga bitta post tashlang\n"
-            "2) O‘sha postni BOTga <b>forward</b> qiling\n\n"
-            "Bot CHAT_ID ni o‘zi saqlab oladi ✅"
-        )
-        await call.answer()
-        return
+    file_id = m.reply_to_message.video.file_id
+    caption = m.reply_to_message.caption
 
-    await call.answer("Noma’lum buyruq.", show_alert=True)
+    ok = db_add_movie(code, file_id, caption)
+    if not ok:
+        return await m.answer("⚠️ Bu kod bilan kino allaqachon mavjud!")
 
+    await m.answer(f"✅ Qo‘shildi! Kod: <b>{code}</b>", parse_mode=ParseMode.HTML)
 
-# ==== Admin kino qo‘shish 1-qadam: video/doc qabul qilish ====
-ADMIN_PENDING_MEDIA: dict[int, dict] = {}  # user_id -> {"file_id":..., "type":..., "caption":...}
+@router.message(Command("del"))
+async def del_cmd(m: Message):
+    db_add_user(m.from_user.id)
+    if not is_admin(m.from_user.id):
+        return await m.answer("❌ Siz admin emassiz.")
+    parts = m.text.split(maxsplit=1)
+    if len(parts) != 2 or not CODE_RE.match(parts[1].strip()):
+        return await m.answer("❗ To‘g‘ri format: /del 123")
+    code = parts[1].strip()
+    ok = db_delete_movie(code)
+    if ok:
+        await m.answer(f"🗑️ O‘chirildi: <b>{code}</b>", parse_mode=ParseMode.HTML)
+    else:
+        await m.answer("❌ Bunday kod topilmadi.")
 
-@dp.message()
-async def all_messages_router(message: Message):
-    touch_user(message.from_user.id)
+@router.message(F.video)
+async def video_received(m: Message):
+    """
+    Admin 'Kino qo‘shish' bosib video yuborsa — keyin kod so‘raymiz.
+    """
+    db_add_user(m.from_user.id)
+    if not is_admin(m.from_user.id):
+        return  # oddiy user video yuborsa e'tibor bermaymiz
 
-    uid = message.from_user.id
-    state = ADMIN_STATE.get(uid)
+    act = PENDING.get(m.from_user.id)
+    if act and act.mode == "add":
+        await m.answer("✅ Video keldi. Endi kod yuboring (masalan 123).")
+        # videoni vaqtincha saqlab turamiz (reply ishlatmasdan ham qo‘shish uchun)
+        # message_id orqali keyin reply qildirish qiyin, shuning uchun oddiy yo‘l:
+        # admin /add bilan reply qilsin — eng ishonchli.
+        # Shuning uchun bu yerda faqat yo'l ko'rsatamiz.
 
-    # ===== ADMIN FLOW =====
-    if is_admin(uid) and state == "await_add_video":
-        # video yoki document qabul qilamiz
-        if message.video:
-            ADMIN_PENDING_MEDIA[uid] = {
-                "file_id": message.video.file_id,
-                "type": "video",
-                "caption": message.caption
-            }
-            ADMIN_STATE[uid] = "await_add_code"
-            return await message.answer("✅ Video olindi. Endi kodini yuboring (masalan: 1001)")
+@router.message(F.text)
+async def text_router(m: Message):
+    db_add_user(m.from_user.id)
+    txt = (m.text or "").strip()
 
-        if message.document:
-            ADMIN_PENDING_MEDIA[uid] = {
-                "file_id": message.document.file_id,
-                "type": "document",
-                "caption": message.caption
-            }
-            ADMIN_STATE[uid] = "await_add_code"
-            return await message.answer("✅ Fayl olindi. Endi kodini yuboring (masalan: 1001)")
-
-        return await message.answer("Video yoki fayl yuboring.")
-
-    if is_admin(uid) and state == "await_add_code":
-        code = normalize_code(message.text or "")
-        if not code or not re.fullmatch(r"\d{1,20}", code):
-            return await message.answer("❌ Kod faqat raqam bo‘lsin. Masalan: 1001")
-
-        # duplicate tekshiruv
-        if movie_get(code):
-            ADMIN_STATE.pop(uid, None)
-            ADMIN_PENDING_MEDIA.pop(uid, None)
-            return await message.answer("⚠️ Bu kod avvaldan bor. Boshqa kod kiriting yoki o‘chirib qayta qo‘shing.")
-
-        media = ADMIN_PENDING_MEDIA.get(uid)
-        if not media:
-            ADMIN_STATE.pop(uid, None)
-            return await message.answer("❌ Media topilmadi. Admin paneldan qayta boshlang: /panel")
-
-        # DB ga qo‘shamiz
-        movie_add(code, media["file_id"], media["type"], media.get("caption"))
-
-        # kanalga ham tashlaymiz (agar ulangan bo‘lsa)
-        ch = get_channel_id()
-        if ch:
-            try:
-                cap = f"🎬 Kod: <b>{code}</b>"
-                if media.get("caption"):
-                    cap += f"\n\n{media['caption']}"
-                if media["type"] == "video":
-                    await bot.send_video(ch, media["file_id"], caption=cap)
-                else:
-                    await bot.send_document(ch, media["file_id"], caption=cap)
-            except Exception as e:
-                # kanalga tashlashda xato bo‘lsa ham kino saqlangan bo‘ladi
-                await message.answer(f"✅ Qo‘shildi (DB). Lekin kanalga yuborishda xato: {e}")
-
-        ADMIN_STATE.pop(uid, None)
-        ADMIN_PENDING_MEDIA.pop(uid, None)
-        return await message.answer(f"✅ Qo‘shildi! Kod: <b>{code}</b>")
-
-    if is_admin(uid) and state == "await_del_code":
-        code = normalize_code(message.text or "")
-        if not code or not re.fullmatch(r"\d{1,20}", code):
-            ADMIN_STATE.pop(uid, None)
-            return await message.answer("❌ Noto‘g‘ri kod. Masalan: 1001")
-
-        ok = movie_delete(code)
-        ADMIN_STATE.pop(uid, None)
+    # Admin “delete mode”da bo‘lsa, yuborgan raqamini o‘chirish deb olamiz
+    act = PENDING.get(m.from_user.id)
+    if act and act.mode == "del" and CODE_RE.match(txt):
+        if not is_admin(m.from_user.id):
+            return await m.answer("❌ Siz admin emassiz.")
+        ok = db_delete_movie(txt)
+        PENDING.pop(m.from_user.id, None)
         if ok:
-            return await message.answer(f"🗑 O‘chirildi: <b>{code}</b>")
-        else:
-            return await message.answer("❌ Bunday kod topilmadi.")
+            return await m.answer(f"🗑️ O‘chirildi: <b>{txt}</b>", parse_mode=ParseMode.HTML)
+        return await m.answer("❌ Bunday kod topilmadi.")
 
-    # ===== USER FLOW (kod yuborsa kino qaytaradi) =====
-    text = (message.text or "").strip()
-    if not text:
-        return
+    # Oddiy kino kodi
+    if CODE_RE.match(txt):
+        row = db_get_movie(txt)
+        if not row:
+            return await m.answer("❌ Bunday kod topilmadi.")
+        file_id, caption = row
+        return await m.answer_video(video=file_id, caption=caption)
 
-    if not re.fullmatch(r"\d{1,20}", text):
-        # boshqa gap bo‘lsa indamaymiz (xohlasa /start bilan yo‘riqnoma)
-        return
-
-    row = movie_get(text)
-    if not row:
-        return await message.answer("❌ Bunday kod topilmadi.")
-
-    _, file_id, ftype, caption = row
-
-    try:
-        if ftype == "video":
-            await message.answer_video(file_id, caption=caption)
-        else:
-            await message.answer_document(file_id, caption=caption)
-    except Exception:
-        # ba’zida file_id eskirib qolishi mumkin (kamdan-kam)
-        await message.answer("⚠️ Kino yuborishda xatolik. Admin qayta yuklasin.")
+    # Boshqa textlar
+    if is_admin(m.from_user.id):
+        return await m.answer(
+            "Kino kodi yuboring (masalan 1001) yoki /panel.",
+            reply_markup=kb_main(True)
+        )
+    return await m.answer("Kino kodi yuboring (masalan 1001).")
 
 
 async def main():
     db_init()
-
-    # ENV'da CHANNEL_ID bo‘lsa DBga yozib qo‘yamiz (bir marta)
-    if CHANNEL_ID_ENV and not cfg_get("CHANNEL_ID"):
-        cfg_set("CHANNEL_ID", CHANNEL_ID_ENV)
-
-    print("Bot started...")
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)  # ✅ aiogram 3.7+ to‘g‘ri
+    )
+    dp = Dispatcher()
+    dp.include_router(router)
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())

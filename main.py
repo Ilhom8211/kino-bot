@@ -109,11 +109,11 @@ def db_delete_movie(code: str):
 
 
 # ===================== UI =====================
-BTN_ADMIN_PANEL = "⚙️ Admin panel"
-BTN_ADD = "➕ Kino qo‘shish"
-BTN_DEL = "🗑️ Kino o‘chirish"
-BTN_STATS = "📊 Statistika"
-BTN_BACK = "⬅️ Orqaga"
+BTN_ADMIN_PANEL = "⚙️ Админ Панель"
+BTN_ADD = "🎬 Добавить кино"
+BTN_DEL = "🗑️ Удалить кино"
+BTN_STATS = "📊 Статистика"
+BTN_BACK = "⬅️ Назад"
 
 def kb_main(is_admin: bool):
     if is_admin:
@@ -162,26 +162,26 @@ CODE_RE = re.compile(r"^\d{1,10}$")  # 1..10 raqam
 async def start(m: Message):
     db_add_user(m.from_user.id)
     text = (
-        "Salom! Kino kodini yuboring.\n"
-        "Masalan: 1001\n\n"
+        "Здравствуйте! Отправьте код фильма.\n"
+"Например: 1001\n\n"
     )
     if is_admin(m.from_user.id):
-        text += "Admin: /panel yoki tugmalar orqali."
+        text += "Админ: через /panel или кнопки."
     await m.answer(text, reply_markup=kb_main(is_admin(m.from_user.id)))
 
 @router.message(Command("panel"))
 async def panel_cmd(m: Message):
     db_add_user(m.from_user.id)
     if not is_admin(m.from_user.id):
-        return await m.answer("❌ Siz admin emassiz.")
-    await m.answer("⚙️ Admin panel:", reply_markup=kb_admin())
+        return await m.answer("❌ Вы не администратор.")
+    await m.answer("⚙️ Админ Панель:", reply_markup=kb_admin())
 
 @router.message(F.text == BTN_ADMIN_PANEL)
 async def panel_btn(m: Message):
     db_add_user(m.from_user.id)
     if not is_admin(m.from_user.id):
-        return await m.answer("❌ Siz admin emassiz.")
-    await m.answer("⚙️ Admin panel:", reply_markup=kb_admin())
+        return await m.answer("❌ Вы не администратор.")
+    await m.answer("⚙️ Aдмин Панель:", reply_markup=kb_admin())
 
 @router.message(F.text == BTN_BACK)
 async def back_btn(m: Message):
@@ -195,9 +195,9 @@ async def stats(m: Message):
     db_add_user(m.from_user.id)
     users_count, movies_count = db_get_stats()
     await m.answer(
-        f"📊 Statistika\n\n"
-        f"👥 Botni ishlatganlar: <b>{users_count}</b>\n"
-        f"🎬 Kinolar soni: <b>{movies_count}</b>",
+        f"📊 Статистика\n\n"
+        f"👥 Пользователи, которые пользовались ботом: <b>{users_count}</b>\n"
+        f"🎬 Количество фильмов: <b>{movies_count}</b>",
         parse_mode=ParseMode.HTML
     )
 
@@ -205,13 +205,13 @@ async def stats(m: Message):
 async def ask_add(m: Message):
     db_add_user(m.from_user.id)
     if not is_admin(m.from_user.id):
-        return await m.answer("❌ Siz admin emassiz.")
+        return await m.answer("❌ Вы не администратор.")
     PENDING[m.from_user.id] = PendingAction(mode="add")
     await m.answer(
-        "➕ Kino qo‘shish:\n"
-        "1) Videoni yuboring (yoki kanal postini forward qiling)\n"
-        "2) Video ustiga reply qilib: <b>/add 123</b>\n\n"
-        "Yoki videoni yuborgandan keyin shunchaki kodni yozing: <b>123</b>",
+        "➕ Добавить кино:\n"
+        "1) Отправьте видео (или перешлите пост из канала))\n"
+        "2) Ответьте на видео: <b>/add 123</b>\n\n"
+        "Или после отправки видео просто напишите код: <b>123</b>",
         parse_mode=ParseMode.HTML
     )
 
@@ -219,15 +219,15 @@ async def ask_add(m: Message):
 async def ask_del(m: Message):
     db_add_user(m.from_user.id)
     if not is_admin(m.from_user.id):
-        return await m.answer("❌ Siz admin emassiz.")
+        return await m.answer("❌ Вы не администратор.")
     PENDING[m.from_user.id] = PendingAction(mode="del")
-    await m.answer("🗑️ O‘chirish uchun kodni yuboring. Masalan: 123")
+    await m.answer("🗑️ Отправьте код для удаления. Например: 123")
 
 @router.message(Command("add"))
 async def add_cmd(m: Message):
     db_add_user(m.from_user.id)
     if not is_admin(m.from_user.id):
-        return await m.answer("❌ Siz admin emassiz.")
+        return await m.answer("❌ Вы не администратор")
 
     # /add 123
     parts = m.text.split(maxsplit=1)
@@ -238,36 +238,36 @@ async def add_cmd(m: Message):
 
     # video reply bo‘lishi kerak
     if not m.reply_to_message or not m.reply_to_message.video:
-        return await m.answer("❗ Videoga reply qilib yuboring: videoga reply → /add 123")
+        return await m.answer("❗ Отправьте в ответ на видео: ответ на видео → /add 123")
 
     file_id = m.reply_to_message.video.file_id
     caption = m.reply_to_message.caption
 
     ok = db_add_movie(code, file_id, caption)
     if not ok:
-        return await m.answer("⚠️ Bu kod bilan kino allaqachon mavjud!")
+        return await m.answer("⚠️ Фильм с таким кодом уже существует!")
 
-    await m.answer(f"✅ Qo‘shildi! Kod: <b>{code}</b>", parse_mode=ParseMode.HTML)
+    await m.answer(f"✅ Добавлено! Код: <b>{code}</b>", parse_mode=ParseMode.HTML)
 
 @router.message(Command("del"))
 async def del_cmd(m: Message):
     db_add_user(m.from_user.id)
     if not is_admin(m.from_user.id):
-        return await m.answer("❌ Siz admin emassiz.")
+        return await m.answer("❌ Вы не администратор.")
     parts = m.text.split(maxsplit=1)
     if len(parts) != 2 or not CODE_RE.match(parts[1].strip()):
         return await m.answer("❗ To‘g‘ri format: /del 123")
     code = parts[1].strip()
     ok = db_delete_movie(code)
     if ok:
-        await m.answer(f"🗑️ O‘chirildi: <b>{code}</b>", parse_mode=ParseMode.HTML)
+        await m.answer(f"🗑️ Удалено: <b>{code}</b>", parse_mode=ParseMode.HTML)
     else:
-        await m.answer("❌ Bunday kod topilmadi.")
+        await m.answer("❌ Такой код не найден.")
 
 @router.message(F.video)
 async def video_received(m: Message):
     """
-    Admin 'Kino qo‘shish' bosib video yuborsa — keyin kod so‘raymiz.
+    Если админ нажмёт «Добавить кино» и отправит видео — потом мы попросим код.
     """
     db_add_user(m.from_user.id)
     if not is_admin(m.from_user.id):
@@ -275,7 +275,7 @@ async def video_received(m: Message):
 
     act = PENDING.get(m.from_user.id)
     if act and act.mode == "add":
-        await m.answer("✅ Video keldi. Endi kod yuboring (masalan 123).")
+        await m.answer("✅ Видео получено. Теперь отправьте код (например 123).")
         # videoni vaqtincha saqlab turamiz (reply ishlatmasdan ham qo‘shish uchun)
         # message_id orqali keyin reply qildirish qiyin, shuning uchun oddiy yo‘l:
         # admin /add bilan reply qilsin — eng ishonchli.
@@ -290,28 +290,28 @@ async def text_router(m: Message):
     act = PENDING.get(m.from_user.id)
     if act and act.mode == "del" and CODE_RE.match(txt):
         if not is_admin(m.from_user.id):
-            return await m.answer("❌ Siz admin emassiz.")
+            return await m.answer("❌ Вы не администратор.")
         ok = db_delete_movie(txt)
         PENDING.pop(m.from_user.id, None)
         if ok:
-            return await m.answer(f"🗑️ O‘chirildi: <b>{txt}</b>", parse_mode=ParseMode.HTML)
-        return await m.answer("❌ Bunday kod topilmadi.")
+            return await m.answer(f"🗑️ Удалено: <b>{txt}</b>", parse_mode=ParseMode.HTML)
+        return await m.answer("❌ Такой код не найден.")
 
     # Oddiy kino kodi
     if CODE_RE.match(txt):
         row = db_get_movie(txt)
         if not row:
-            return await m.answer("❌ Bunday kod topilmadi.")
+            return await m.answer("❌ Такой код не найден.")
         file_id, caption = row
         return await m.answer_video(video=file_id, caption=caption)
 
     # Boshqa textlar
     if is_admin(m.from_user.id):
         return await m.answer(
-            "Kino kodi yuboring (masalan 1001) yoki /panel.",
+            Отправьте код фильма (например 1001) или /panel.",
             reply_markup=kb_main(True)
         )
-    return await m.answer("Kino kodi yuboring (masalan 1001).")
+    return await m.answer("Отправьте код фильма (например 1001).")
 
 
 async def main():
@@ -326,3 +326,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
